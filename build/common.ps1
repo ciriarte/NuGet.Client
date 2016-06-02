@@ -1,18 +1,22 @@
 ### Constants ###
-$ValidConfigurations = 'debug', 'release'
 $DefaultConfiguration = 'debug'
-$ValidReleaseLabels = 'Release','rtm', 'rc', 'beta', 'local'
-$DefaultReleaseLabel = 'local'
+$DefaultReleaseLabel = 'zlocal'
 
 $DefaultDnxVersion = '1.0.0-rc1-update1'
 $DefaultDnxArch = 'x86'
 $NuGetClientRoot = Split-Path -Path $PSScriptRoot -Parent
 $MSBuildExe = Join-Path ${env:ProgramFiles(x86)} 'MSBuild\14.0\Bin\msbuild.exe'
 $NuGetExe = Join-Path $NuGetClientRoot '.nuget\nuget.exe'
+$XunitConsole = Join-Path $NuGetClientRoot 'packages\xunit.runner.console.2.1.0\tools\xunit.console.exe'
 $ILMerge = Join-Path $NuGetClientRoot 'packages\ILMerge.2.14.1208\tools\ILMerge.exe'
 $DnvmCmd = Join-Path $env:USERPROFILE '.dnx\bin\dnvm.cmd'
 $Nupkgs = Join-Path $NuGetClientRoot nupkgs
 $Artifacts = Join-Path $NuGetClientRoot artifacts
+
+Set-Alias nuget $NuGetExe
+Set-Alias xunit $XunitConsole
+Set-Alias ilmerge $ILMerge
+Set-Alias dnvm $DnvmCmd
 
 Function Read-PackageSources {
     param($NuGetConfig)
@@ -42,8 +46,16 @@ Function Verbose-Log($VerboseMessage) {
     Write-Verbose "[$(Trace-Time)]`t$VerboseMessage"
 }
 
-Function Error-Log($ErrorMessage) {
-    Write-Error "[$(Trace-Time)]`t$ErrorMessage"
+Function Error-Log {
+    param(
+        [string]$ErrorMessage,
+        [switch]$Fatal)
+    if (-not $Fatal) {
+        Write-Error "[$(Trace-Time)]`t$ErrorMessage"
+    }
+    else {
+        Write-Error "[$(Trace-Time)]`t$ErrorMessage" -ErrorAction Stop
+    }
 }
 
 Function Warning-Log($WarningMessage) {
@@ -114,7 +126,7 @@ Function Update-Submodules {
         $opts += '--quiet'
     }
     Trace-Log 'Updating and initializing submodules'
-    Verbose-Log "git $opts"
+    Trace-Log "git $opts"
     & git $opts 2>&1
 }
 
@@ -135,7 +147,6 @@ Function Install-DNVM {
     if (-not (Test-Path $DnvmCmd)) {
         Trace-Log 'Downloading DNVM'
         &{
-            $Branch='dev'
             iex (`
                 (new-object net.webclient).DownloadString('https://raw.githubusercontent.com/aspnet/Home/dev/dnvminstall.ps1')`
             )
@@ -159,7 +170,7 @@ Function Install-DNX {
     )
     Install-DNVM
     $env:DNX_FEED = 'https://www.nuget.org/api/v2'
-    Verbose-Log "dnvm install $Version -runtime $Runtime -arch $Arch"
+    Trace-Log "dnvm install $Version -runtime $Runtime -arch $Arch"
     if ($Default) {
         & dnvm install $Version -runtime $Runtime -arch $Arch -alias default 2>&1
     }
@@ -180,14 +191,52 @@ Function Use-DNX {
         [Alias('a')]
         [string]$Arch = $DefaultDnxArch
     )
-    Verbose-Log "dnvm use $Version -runtime $Runtime -arch $Arch"
+    Trace-Log "dnvm use $Version -runtime $Runtime -arch $Arch"
     & dnvm use $Version -runtime $Runtime -arch $Arch 2>&1
+}
+
+Function Enable-DelaySigningForDnx {
+    param(
+        $xproject,
+        $KeyFile
+    )
+    Verbose-Log "Adding keyFile '$KeyFile' to compilationOptions"
+
+    $compilationOptions = $xproject.compilationOptions
+
+    if ($compilationOptions -eq $null) {
+        $newSection = ConvertFrom-Json -InputObject '{ }'
+        $xproject | Add-Member -Name "compilationOptions" -value $newSection -MemberType NoteProperty
+        $compilationOptions = $xproject.compilationOptions
+    }
+
+    if (-not $xproject.compilationOptions.keyFile) {
+        $compilationOptions | Add-Member -Name "keyFile" -value $KeyFile -MemberType NoteProperty
+    }
+    else {
+        Warning-Log "keyFile already exists"
+    }
+
+    if (-not $xproject.compilationOptions.delaySign) {
+        $compilationOptions | Add-Member -Name "delaySign" -value $true -MemberType NoteProperty
+    }
+    else {
+        Warning-Log "delaySign already exists"
+    }
+}
+
+Function Save-ProjectFile ($xproject, $fileName) {
+    Trace-Log "Saving project to '$fileName'"
+    $xproject | ConvertTo-Json -Depth 999 | Out-File $fileName
 }
 
 # Enables delay signed build
 Function Enable-DelaySigning {
     [CmdletBinding()]
-    param($MSPFXPath, $NuGetPFXPath)
+    param(
+        $MSPFXPath,
+        $NuGetPFXPath
+    )
     if (Test-Path $MSPFXPath) {
         Trace-Log "Setting NuGet.Core solution to delay sign using $MSPFXPath"
         $env:DNX_BUILD_KEY_FILE=$MSPFXPath
@@ -195,6 +244,22 @@ Function Enable-DelaySigning {
 
         Trace-Log "Using the Microsoft Key for NuGet Command line $MSPFXPath"
         $env:MS_PFX_PATH=$MSPFXPath
+
+        $XProjectsLocation = Join-Path $NuGetClientRoot '\src\NuGet.Core'
+        Trace-Log "Adding KeyFile '$MSPFXPath' to project files in '$XProjectsLocation'"
+        (Get-ChildItem $XProjectsLocation -rec -Filter 'project.json') |
+            %{ $_.FullName } |
+            %{
+                Verbose-Log "Processing '$_'"
+                $xproject = (Get-Content $_ -Raw) | ConvertFrom-Json
+                if (-not $xproject) {
+                    Write-Error "'$_' is not a valid json file"
+                }
+                else {
+                    Enable-DelaySigningForDnx $xproject $MSPFXPath
+                    Save-ProjectFile $xproject $_
+                }
+            }
     }
 
     if (Test-Path $NuGetPFXPath) {
@@ -289,8 +354,8 @@ Function Restore-SolutionPackages{
     }
 
     Trace-Log "Restoring packages @""$NuGetClientRoot"""
-    Verbose-Log "$NuGetExe $opts"
-    & $NuGetExe $opts 2>&1
+    Trace-Log "$NuGetExe $opts"
+    & $NuGetExe $opts
     if (-not $?) {
         Error-Log "Restore failed @""$NuGetClientRoot"". Code: ${LASTEXITCODE}"
     }
@@ -314,7 +379,7 @@ Function Restore-XProject {
             }
 
             Trace-Log "Restoring packages @""$_"""
-            Verbose-Log "dnu $opts"
+            Trace-Log "dnu $opts"
             & dnu $opts 2>&1
             if (-not $?) {
                 Error-Log "Restore failed @""$_"". Code: $LASTEXITCODE"
@@ -337,7 +402,7 @@ Function Restore-XProjectsFast {
     }
 
     Trace-Log "Restoring packages @""$XProjectsLocation"""
-    Verbose-Log "dnu $opts"
+    Trace-Log "dnu $opts"
     & dnu $opts 2>&1
     if (-not $?) {
         Error-Log "Restore failed @""$XProjectsLocation"". Code: $LASTEXITCODE"
@@ -399,7 +464,7 @@ Function Invoke-DnuPack {
                 $opts += '--quiet'
             }
 
-            Verbose-Log "dnu $opts"
+            Trace-Log "dnu $opts"
             &dnu $opts 2>&1
             if (-not $?) {
                 Error-Log "Pack failed @""$_"". Code: $LASTEXITCODE"
@@ -436,7 +501,8 @@ Function Test-XProject {
     [CmdletBinding()]
     param(
         [parameter(ValueFromPipeline=$True, Mandatory=$True, Position=0)]
-        [string[]]$XProjectLocations
+        [string[]]$XProjectLocations,
+        [string]$Configuration = $DefaultConfiguration
     )
     Begin {
         # Test assemblies should not be signed
@@ -449,17 +515,17 @@ Function Test-XProject {
         }
     }
     Process {
-        $XProjectLocations | %{
+        $XProjectLocations | Resolve-Path | %{
             Trace-Log "Running tests in ""$_"""
 
-            $opts = '-p', $_, 'test'
+            $opts = '-p', $_, 'test', '--configuration', $Configuration
             if ($VerbosePreference) {
                 $opts += '-diagnostics', '-verbose'
             }
             else {
                 $opts += '-nologo', '-quiet'
             }
-            Verbose-Log "dnx $opts"
+            Trace-Log "dnx $opts"
 
             # Check if dnxcore50 exists in the project.json file
             $xtestProjectJson = Join-Path $_ "project.json"
@@ -487,7 +553,8 @@ Function Test-CoreProjects {
     [CmdletBinding()]
     param(
         [switch]$SkipRestore,
-        [switch]$Fast
+        [switch]$Fast,
+        [string]$Configuration = $DefaultConfiguration
     )
     $XProjectsLocation = Join-Path $NuGetClientRoot test\NuGet.Core.Tests
 
@@ -496,7 +563,7 @@ Function Test-CoreProjects {
     }
 
     $xtests = Find-XProjects $XProjectsLocation
-    $xtests | Test-XProject
+    $xtests | Test-XProject -Configuration $Configuration
 }
 
 Function Build-ClientsProjects {
@@ -529,7 +596,7 @@ Function Build-ClientsProjects {
         $opts += '/verbosity:minimal'
     }
 
-    Verbose-Log "$MSBuildExe $opts"
+    Trace-Log "$MSBuildExe $opts"
     & $MSBuildExe $opts
     if (-not $?) {
         Error-Log "Build of NuGet.Clients.sln failed. Code: $LASTEXITCODE"
@@ -551,7 +618,7 @@ Function Test-ClientsProjects {
         if (-not $VerbosePreference) {
             $opts += '/verbosity:minimal'
         }
-        Verbose-Log "$MSBuildExe $opts"
+        Trace-Log "$MSBuildExe $opts"
         & $MSBuildExe $opts
         if (-not $?) {
             Error-Log "Tests failed @""$testProj"". Code: $LASTEXITCODE"
@@ -567,7 +634,8 @@ Function Read-FileList($FilePath) {
 Function Invoke-ILMerge {
     [CmdletBinding()]
     param(
-        [string]$Configuration = $DefaultConfiguration
+        [string]$Configuration = $DefaultConfiguration,
+        [string]$KeyFile
     )
     $buildArtifactsFolder = [io.path]::combine($Artifacts, 'NuGet.CommandLine', $Configuration)
     $ignoreList = Read-FileList (Join-Path $buildArtifactsFolder '.mergeignore')
@@ -587,10 +655,14 @@ Function Invoke-ILMerge {
     $opts = , 'NuGet.exe'
     $opts += $buildArtifacts
     $opts += "/out:$Artifacts\NuGet.exe"
+    if ($KeyFile) {
+        $opts += "/delaysign"
+        $opts += "/keyfile:$KeyFile"
+    }
     if ($VerbosePreference) {
         $opts += '/log'
     }
-    Verbose-Log "$ILMerge $opts"
+    Trace-Log "$ILMerge $opts"
 
     pushd $buildArtifactsFolder
     try {
