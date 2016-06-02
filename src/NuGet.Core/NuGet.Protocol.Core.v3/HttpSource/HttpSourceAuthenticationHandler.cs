@@ -96,6 +96,9 @@ namespace NuGet.Protocol
                     response.StatusCode == HttpStatusCode.Forbidden)
                 {
                     promptCredentials = await AcquireCredentialsAsync(response.StatusCode, beforeLockVersion, logger, cancellationToken);
+
+                    cancellationToken.ThrowIfCancellationRequested();
+
                     if (promptCredentials == null)
                     {
                         return response;
